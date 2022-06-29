@@ -10,7 +10,7 @@ import progressbar
 import torchaudio
 
 from tortoise.models.classifier import AudioMiniEncoderWithClassifierHead
-from tortoise.models.diffusion_decoder import DiffusionTts
+from tortoise.models.diffusion_decoder import DiffusionTts, DiffusionTtsV2
 from tortoise.models.autoregressive import UnifiedVoice
 from tqdm import tqdm
 
@@ -230,9 +230,28 @@ class TextToSpeech:
                                           train_solo_embeddings=False).cpu().eval()
             self.autoregressive.load_state_dict(torch.load(get_model_path('autoregressive.pth', models_dir)))
 
-            self.diffusion = DiffusionTts(model_channels=1024, num_layers=10, in_channels=100, out_channels=200,
-                                          in_latent_channels=1024, in_tokens=8193, dropout=0, use_fp16=False, num_heads=16,
-                                          layer_drop=0, unconditioned_percentage=0).cpu().eval()
+            if os.environ.get('TTSV2', '') == '1':
+                print('Using TTSV2')
+                self.diffusion = DiffusionTtsV2(
+                    in_channels=100,
+                    out_channels=200,
+                    model_channels=1024,
+                    contraction_dim=512,
+                    prenet_channels=1024,
+                    prenet_layers=6,
+                    num_heads=8,
+                    num_layers=12,
+                    input_vec_dim=1024,
+                    dropout=0,
+                    unconditioned_percentage=0,
+                    use_fp16=False,
+                    ar_prior=True,
+                    freeze_except_code_converters=False,
+                )
+            else:
+                self.diffusion = DiffusionTts(model_channels=1024, num_layers=10, in_channels=100, out_channels=200,
+                                            in_latent_channels=1024, in_tokens=8193, dropout=0, use_fp16=False, num_heads=16,
+                                            layer_drop=0, unconditioned_percentage=0).cpu().eval()
             self.diffusion.load_state_dict(torch.load(get_model_path('diffusion_decoder.pth', models_dir)))
 
         self.clvp = CLVP(dim_text=768, dim_speech=768, dim_latent=768, num_text_tokens=256, text_enc_depth=20,

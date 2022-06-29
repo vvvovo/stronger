@@ -29,6 +29,7 @@ setuptools.setup(
         'librosa',
         'transformers',
         'tokenizers',
+        'entmax',
     ],
     classifiers=[
         "Programming Language :: Python :: 3",

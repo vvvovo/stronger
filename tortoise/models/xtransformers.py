@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from torch import nn, einsum
+from entmax import entmax15
 
 DEFAULT_DIM_HEAD = 64
 
@@ -481,6 +482,7 @@ class Attention(nn.Module):
     def __init__(
             self,
             dim,
+            out_dim=None,
             dim_head=DEFAULT_DIM_HEAD,
             heads=8,
             causal=False,
@@ -501,9 +503,10 @@ class Attention(nn.Module):
             rel_pos_bias=False,
             rel_pos_num_buckets=32,
             rel_pos_max_distance=128,
+            mup_scale=False
     ):
         super().__init__()
-        self.scale = dim_head ** -0.5
+        self.scale = 8/dim_head if mup_scale else dim_head ** -0.5
 
         self.heads = heads
         self.causal = causal
@@ -552,7 +555,7 @@ class Attention(nn.Module):
         self.sparse_topk = sparse_topk
 
         # entmax
-        self.attn_fn = F.softmax
+        self.attn_fn = entmax15 if use_entmax15 else F.softmax
 
         # add memory key / values
         self.num_mem_kv = num_mem_kv
@@ -562,7 +565,8 @@ class Attention(nn.Module):
 
         # attention on attention
         self.attn_on_attn = on_attn
-        self.to_out = nn.Sequential(nn.Linear(v_dim, dim * 2), nn.GLU()) if on_attn else nn.Linear(v_dim, dim)
+        out_dim = default(out_dim, dim)
+        self.to_out = nn.Sequential(nn.Linear(v_dim, out_dim * 2), nn.GLU()) if on_attn else nn.Linear(v_dim, out_dim)
 
         self.rel_pos_bias = rel_pos_bias
         if rel_pos_bias:

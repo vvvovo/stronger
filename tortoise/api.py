@@ -34,6 +34,7 @@ MODELS = {
     'clvp2.pth': 'https://huggingface.co/jbetker/tortoise-tts-v2/resolve/main/.models/clvp2.pth',
     'cvvp.pth': 'https://huggingface.co/jbetker/tortoise-tts-v2/resolve/main/.models/cvvp.pth',
     'diffusion_decoder.pth': 'https://huggingface.co/jbetker/tortoise-tts-v2/resolve/main/.models/diffusion_decoder.pth',
+    'diffusion_decoder2.pth': '#not-yet-available',
     'vocoder.pth': 'https://huggingface.co/jbetker/tortoise-tts-v2/resolve/main/.models/vocoder.pth',
     'rlg_auto.pth': 'https://huggingface.co/jbetker/tortoise-tts-v2/resolve/main/.models/rlg_auto.pth',
     'rlg_diffuser.pth': 'https://huggingface.co/jbetker/tortoise-tts-v2/resolve/main/.models/rlg_diffuser.pth',
@@ -161,6 +162,19 @@ def do_spectrogram_diffusion(diffusion_model, diffuser, latents, conditioning_la
         return denormalize_tacotron_mel(mel)[:,:,:output_seq_len]
 
 
+def do_ar_prior_diffusion(diffusion_model, diffuser, latents, temperature=1, verbose=True):
+    """
+    Uses the specified diffusion model to convert discrete codes into a spectrogram.
+    """
+    with torch.no_grad():
+        output_seq_len = latents.shape[1] * 4 * 24000 // 22050
+        output_shape = (latents.shape[0], 100, output_seq_len)
+        noise = torch.randn(output_shape, device=latents.device) * temperature
+        mel = diffuser.p_sample_loop(diffusion_model, output_shape, noise=noise,
+                                     model_kwargs={'codes': latents}, progress=verbose)
+        return denormalize_tacotron_mel(mel)[:,:,:output_seq_len]
+
+
 def classify_audio_clip(clip):
     """
     Returns whether or not Tortoises' classifier thinks the given clip came from Tortoise.
@@ -198,7 +212,7 @@ class TextToSpeech:
     Main entry point into Tortoise.
     """
 
-    def __init__(self, autoregressive_batch_size=None, models_dir=MODELS_DIR, enable_redaction=True, device=None):
+    def __init__(self, autoregressive_batch_size=None, models_dir=MODELS_DIR, enable_redaction=True, device=None, force_v1_models=False):
         """
         Constructor
         :param autoregressive_batch_size: Specifies how many samples to generate per batch. Lower this if you are seeing
@@ -213,12 +227,14 @@ class TextToSpeech:
         self.models_dir = models_dir
         self.autoregressive_batch_size = pick_best_batch_size_for_gpu() if autoregressive_batch_size is None else autoregressive_batch_size
         self.enable_redaction = enable_redaction
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.diffusion_v2 = False
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.device = torch.device(device)
         if self.enable_redaction:
             self.aligner = Wav2VecAlignment()
 
         self.tokenizer = VoiceBpeTokenizer()
-
         if os.path.exists(f'{models_dir}/autoregressive.ptt'):
             # Assume this is a traced directory.
             self.autoregressive = torch.jit.load(f'{models_dir}/autoregressive.ptt')
@@ -229,9 +245,9 @@ class TextToSpeech:
                                           heads=16, number_text_tokens=255, start_text_token=255, checkpointing=False,
                                           train_solo_embeddings=False).cpu().eval()
             self.autoregressive.load_state_dict(torch.load(get_model_path('autoregressive.pth', models_dir)))
-
-            if os.environ.get('TTSV2', '') == '1':
-                print('Using TTSV2')
+            if os.path.isfile(os.path.join(models_dir, 'diffusion_decoder2.pth')) and not force_v1_models:
+                print('Using diffusion decoder v2')
+                self.diffusion_v2 = True
                 self.diffusion = DiffusionTtsV2(
                     in_channels=100,
                     out_channels=200,
@@ -248,11 +264,12 @@ class TextToSpeech:
                     ar_prior=True,
                     freeze_except_code_converters=False,
                 )
+                self.diffusion.load_state_dict(torch.load(get_model_path('diffusion_decoder2.pth', models_dir)))
             else:
                 self.diffusion = DiffusionTts(model_channels=1024, num_layers=10, in_channels=100, out_channels=200,
                                             in_latent_channels=1024, in_tokens=8193, dropout=0, use_fp16=False, num_heads=16,
                                             layer_drop=0, unconditioned_percentage=0).cpu().eval()
-            self.diffusion.load_state_dict(torch.load(get_model_path('diffusion_decoder.pth', models_dir)))
+                self.diffusion.load_state_dict(torch.load(get_model_path('diffusion_decoder.pth', models_dir)))
 
         self.clvp = CLVP(dim_text=768, dim_speech=768, dim_latent=768, num_text_tokens=256, text_enc_depth=20,
                          text_seq_len=350, text_heads=12,
@@ -304,9 +321,12 @@ class TextToSpeech:
                 diffusion_conds.append(cond_mel)
             diffusion_conds = torch.stack(diffusion_conds, dim=1)
 
-            self.diffusion = self.diffusion.to(self.device)
-            diffusion_latent = self.diffusion.get_conditioning(diffusion_conds)
-            self.diffusion = self.diffusion.cpu()
+            if not self.diffusion_v2:
+                self.diffusion = self.diffusion.to(self.device)
+                diffusion_latent = self.diffusion.get_conditioning(diffusion_conds)
+                self.diffusion = self.diffusion.cpu()
+            else:
+                diffusion_latent = None
 
         if return_mels:
             return auto_latent, diffusion_latent, auto_conds, diffusion_conds
@@ -414,7 +434,6 @@ class TextToSpeech:
         else:
             auto_conditioning, diffusion_conditioning = self.get_random_conditioning_latents()
         auto_conditioning = auto_conditioning.to(self.device)
-        diffusion_conditioning = diffusion_conditioning.to(self.device)
 
         diffuser = load_discrete_vocoder_diffuser(desired_diffusion_steps=diffusion_iterations, cond_free=cond_free, cond_free_k=cond_free_k)
 
@@ -507,8 +526,13 @@ class TextToSpeech:
                         latents = latents[:, :k]
                         break
 
-                mel = do_spectrogram_diffusion(self.diffusion, diffuser, latents, diffusion_conditioning,
-                                               temperature=diffusion_temperature, verbose=verbose)
+                if self.diffusion_v2:
+                    mel = do_ar_prior_diffusion(self.diffusion, diffuser, latents, temperature=diffusion_temperature, verbose=verbose)
+                else:
+                    diffusion_conditioning = diffusion_conditioning.to(self.device)
+                    mel = do_spectrogram_diffusion(self.diffusion, diffuser, latents, diffusion_conditioning,
+                                                   temperature=diffusion_temperature, verbose=verbose)
+
                 wav = self.vocoder.inference(mel)
                 wav_candidates.append(wav.cpu())
             self.diffusion = self.diffusion.cpu()
